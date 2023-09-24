@@ -1,21 +1,14 @@
-import boofcv.abst.fiducial.calib.ConfigECoCheckDetector
-import boofcv.abst.fiducial.calib.ConfigECoCheckMarkers
 import boofcv.abst.fiducial.calib.ConfigGridDimen
 import boofcv.abst.geo.calibration.CalibrateMonoPlanar
-import boofcv.abst.geo.calibration.MultiToSingleFiducialCalibration
-import boofcv.alg.distort.LensDistortionNarrowFOV
-import boofcv.alg.distort.brown.LensDistortionBrown
 import boofcv.factory.fiducial.ConfigFiducialHammingDetector
 import boofcv.factory.fiducial.ConfigHammingMarker
 import boofcv.factory.fiducial.FactoryFiducial
 import boofcv.factory.fiducial.FactoryFiducialCalibration
 import boofcv.factory.fiducial.HammingDictionary
 import boofcv.gui.feature.VisualizeFeatures
-import boofcv.gui.feature.VisualizeShapes
 import boofcv.gui.fiducial.VisualizeFiducial
 import boofcv.gui.image.ImagePanel
 import boofcv.gui.image.ShowImages
-import boofcv.io.UtilIO
 import boofcv.io.calibration.CalibrationIO
 import boofcv.io.webcamcapture.UtilWebcamCapture
 import boofcv.kotlin.asGrayF32
@@ -23,8 +16,6 @@ import boofcv.kotlin.asGrayU8
 import boofcv.kotlin.asNarrowDistortion
 import boofcv.struct.calib.CameraPinholeBrown
 import boofcv.struct.image.GrayU8
-import com.github.sarxos.webcam.Webcam
-import com.github.sarxos.webcam.WebcamUtils
 import georegression.struct.point.Point2D_F64
 import georegression.struct.se.Se3_F64
 import georegression.struct.shapes.Polygon2D_F64
@@ -32,12 +23,40 @@ import java.awt.BasicStroke
 import java.awt.Color
 import java.awt.image.BufferedImage
 import java.io.UncheckedIOException
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.max
+import kotlin.math.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
 
 const val CALIBRATION_FILENAME = "intrinsics.yaml"
+const val MAX_FRAMES = 120
+const val MAX_DETECTIONS = 512
+
+class AnnotatedImage(
+	var img: BufferedImage,
+	var detections: Int,
+	var frameNumber: Int,
+	var frameTime: Float,
+	val ids: MutableList<Long>,
+	val pose: List<Se3_F64>,
+	// These are both extra annotations
+	val bounds: List<Polygon2D_F64>,
+	val pixel: List<Point2D_F64>,
+) {
+	companion object {
+		fun preallocate(img: BufferedImage): AnnotatedImage {
+			return AnnotatedImage(
+				img = img,
+				detections = 0,
+				frameNumber = 0,
+				frameTime = 0.0F,
+				MutableList(MAX_DETECTIONS) { 0 },
+				MutableList(MAX_DETECTIONS) { Se3_F64() },
+				MutableList(MAX_DETECTIONS) { Polygon2D_F64() },
+				MutableList(MAX_DETECTIONS) { Point2D_F64() }
+			)
+		}
+	}
+}
 
 
 fun main(args: Array<String>) = runBlocking {
@@ -45,6 +64,7 @@ fun main(args: Array<String>) = runBlocking {
 	val width = 1280
 	val height = 720
 	//val imageChannel = Channel<BufferedImage>()
+	val frameBuffer = CircularReferenceBuffer<AnnotatedImage>(MAX_FRAMES) { AnnotatedImage.preallocate(BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB)) }
 
 	// Try loading calibration OR calibrate
 	val intrinsics = try {
@@ -56,49 +76,20 @@ fun main(args: Array<String>) = runBlocking {
 	//val intrinsics = CameraPinholeBrown(640.0, 360.0, 0.0, 640.0, 360.0, 1280, 720)
 	//val distortion: LensDistortionNarrowFOV = LensDistortionBrown(intrinsics)
 
-	val quit: AtomicBoolean = AtomicBoolean(false)
-	//val imageStream = produceImageStream(quit, 1280, 720)
-	val webcam = UtilWebcamCapture.openDefault(width, height)
+	// frameGenerator -> { many annotatedImageStream generators } ->
+	val frames = generateImageStream(intrinsics)
+	val localizations = detectFiducials(intrinsics, frameBuffer, frames)
+	val annotations = annotateImages(intrinsics, localizations)
 
 	val gui = ImagePanel()
 	gui.preferredSize = java.awt.Dimension(1280, 720) //webcam.viewSize
 	ShowImages.showWindow(gui, "TITLE!", true)
 
 	// Reminder: maximum UDP packet size: 16kb.
-	//val param: CameraPinholeBrown = CalibrationIO.load();
-	//LensDistortionNarrowFOV lensDistortion = new LensDistortionBrown(param);
 
-	//val detector = FactoryFiducial.qrcode(null, GrayU8::class.java)
-	val detector = FactoryFiducial.squareHamming(ConfigHammingMarker.loadDictionary(HammingDictionary.APRILTAG_36h10), ConfigFiducialHammingDetector(), GrayU8::class.java)
-	detector.setLensDistortion(intrinsics.asNarrowDistortion(), webcam.viewSize.width, webcam.viewSize.height)
-	assert(detector.is3D)
-
-	val bounds = Polygon2D_F64();
-	val targetToSensor = Se3_F64();
-	val locationPixel = Point2D_F64();
-	while (true) {
-		val image = webcam.image ?: break
-
-		// For QR
-		//detector.process(image.asGrayU8())
-		detector.detect(image.asGrayU8())
-
-		val g2 = image.createGraphics()
-		g2.color = Color.RED
-		g2.stroke = BasicStroke(4.0f)
-		//for (qr in detector.detections) {
-		for(i in 0 ..< detector.totalFound()) {
-			val ident = detector.getId(i)
-			detector.getCenter(i, locationPixel)
-			detector.getBounds(i, bounds)
-			// is3D:
-			detector.getFiducialToCamera(i, targetToSensor)
-			//VisualizeShapes.drawPolygon(bounds, true, 1.0, g2)
-			VisualizeFiducial.drawCube(targetToSensor, intrinsics, 1.0, 1, g2)
-			VisualizeFiducial.drawLabelCenter(targetToSensor, intrinsics, ". ID:${ident}", g2)
-		}
-
-		gui.setImageRepaint(image)
+	for(img in annotations) {
+		//val annotatedImage: AnnotatedImage = localizations.receive()
+		gui.setImageRepaint(img)
 	}
 }
 
@@ -112,12 +103,72 @@ fun withFrameIterator(width: Int, height: Int, f: (img: BufferedImage) -> Unit) 
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
-fun CoroutineScope.produceImageStream(quit: AtomicBoolean, width: Int, height: Int): ReceiveChannel<BufferedImage> = produce {
-	val webcam = UtilWebcamCapture.openDefault(width, height)
-	while(!quit.get()) {
+fun CoroutineScope.generateImageStream(intrinsics: CameraPinholeBrown): ReceiveChannel<BufferedImage> = produce<BufferedImage> {
+	val webcam = UtilWebcamCapture.openDefault(intrinsics.width, intrinsics.height)
+	while(true) {
 		val image = webcam.image ?: break
 		send(image)
 	}
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
+fun CoroutineScope.detectFiducials(intrinsics: CameraPinholeBrown, frameBuffer:CircularReferenceBuffer<AnnotatedImage>, imageStream: ReceiveChannel<BufferedImage>): ReceiveChannel<AnnotatedImage> = produce<AnnotatedImage> {
+	val detector = FactoryFiducial.squareHamming(ConfigHammingMarker.loadDictionary(HammingDictionary.APRILTAG_36h10), ConfigFiducialHammingDetector(), GrayU8::class.java)
+	detector.setLensDistortion(intrinsics.asNarrowDistortion(), intrinsics.width, intrinsics.height)
+	assert(detector.is3D)
+
+	var frameCount = 0
+
+	for(image in imageStream) {
+		val ref = frameBuffer.writeNext()
+		if(ref == null) {
+			Thread.sleep(100)
+			continue
+		}
+
+		frameCount++
+
+		// For QR
+		//detector.process(image.asGrayU8())
+		detector.detect(image.asGrayU8())
+		ref.frameNumber = frameCount
+		ref.detections = detector.totalFound()
+		ref.img = image
+		for(i in 0..< min(MAX_DETECTIONS, ref.detections)) {
+			ref.ids[i] = detector.getId(i)
+			detector.getCenter(i, ref.pixel[i])
+			detector.getBounds(i, ref.bounds[i])
+			detector.getFiducialToCamera(i, ref.pose[i])
+		}
+
+		send(ref)
+		Thread.sleep(1)
+		//frameBuffer.readNext() // Mark as read?
+	}
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
+fun CoroutineScope.broadcastFiducialPoses(imageData: ReceiveChannel<AnnotatedImage>): ReceiveChannel<AnnotatedImage> = produce {
+	// TODO: Send out the image and then maybe push it onto the annotated image pile.
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
+fun CoroutineScope.annotateImages(intrinsics: CameraPinholeBrown, annotatedImageStream: ReceiveChannel<AnnotatedImage>): ReceiveChannel<BufferedImage> = produce {
+	for(annotatedImage in annotatedImageStream) {
+		val image: BufferedImage = annotatedImage.img
+		val g2 = image.createGraphics()
+		g2.color = Color.RED
+		g2.stroke = BasicStroke(4.0f)
+		//for (qr in detector.detections) {
+		for (i in 0..<annotatedImage.detections) {
+			val ident = annotatedImage.ids[i]
+			//VisualizeShapes.drawPolygon(bounds, true, 1.0, g2)
+			VisualizeFiducial.drawCube(annotatedImage.pose[i], intrinsics, 1.0, 1, g2)
+			VisualizeFiducial.drawLabelCenter(annotatedImage.pose[i], intrinsics, ". ID:${ident}", g2)
+		}
+		send(image)
+	}
+
 }
 
 fun runCalibration(width: Int, height: Int): CameraPinholeBrown {
