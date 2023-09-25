@@ -20,24 +20,30 @@ class CircularReferenceBuffer <T>(bufferSize: Int, builder: () -> T) {
 	/***
 	 * Returns a reference to the next element to be read OR null if the buffer is empty.
 	 */
-	suspend fun readNext(): T? = this.mutex.withLock {
-		if(this.readHead != this.writeHead) {
-			val readElement = this.data[this.readHead]
-			this.readHead = (this.readHead + 1) % this.capacity
-			readElement
-		} else {
-			null
+	suspend fun readNext(): T? {
+		var element: T? = null;
+		this.mutex.withLock {
+			if(this.readHead == this.writeHead) {
+				// Empty.
+			} else {
+				element = this.data[this.readHead]
+				this.readHead = (this.readHead + 1) % this.capacity
+			}
 		}
+		return element
 	}
 
-	suspend fun writeNext(): T? = this.mutex.withLock {
-		val nextWritePosition = (this.writeHead + 1) % this.capacity
-		if(nextWritePosition == this.readHead) {
-			null
-		} else {
-			val writeElement = this.data[nextWritePosition]
-			this.writeHead = nextWritePosition
-			writeElement
+	suspend fun writeNext(): T? {
+		var element: T? = null;
+		this.mutex.withLock {
+			val nextWrite = (this.writeHead + 1) % this.capacity
+			if(nextWrite == this.readHead) {
+				// Empty
+			} else {
+				element = this.data[this.writeHead]
+				this.writeHead = nextWrite
+			}
 		}
+		return element
 	}
 }

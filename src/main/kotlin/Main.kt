@@ -26,10 +26,13 @@ import java.io.UncheckedIOException
 import kotlin.math.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 const val CALIBRATION_FILENAME = "intrinsics.yaml"
-const val MAX_FRAMES = 120
+const val RAW_CAMERA_BUFFER_SIZE = 120
+const val FIDUCIAL_BUFFER_SIZE = 120
 const val MAX_DETECTIONS = 512
+const val ANNOTATION_WORKERS = 1
 
 class AnnotatedImage(
 	var img: BufferedImage,
@@ -63,31 +66,39 @@ fun main(args: Array<String>) = runBlocking {
 	//val tagDirectory: String = UtilIO.pathExample("fiducial/square_hamming/aruco_25h7")
 	val width = 1280
 	val height = 720
-	//val imageChannel = Channel<BufferedImage>()
-	val frameBuffer = CircularReferenceBuffer<AnnotatedImage>(MAX_FRAMES) { AnnotatedImage.preallocate(BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB)) }
+	val quit = AtomicBoolean(false)
 
 	// Try loading calibration OR calibrate
 	val intrinsics = try {
 		CalibrationIO.load<CameraPinholeBrown>(CALIBRATION_FILENAME)
 	} catch(e: UncheckedIOException) {
-		runCalibration(1280, 720)
+		runCalibration(width, height)
 	}
 
 	//val intrinsics = CameraPinholeBrown(640.0, 360.0, 0.0, 640.0, 360.0, 1280, 720)
 	//val distortion: LensDistortionNarrowFOV = LensDistortionBrown(intrinsics)
 
-	// frameGenerator -> { many annotatedImageStream generators } ->
-	val frames = generateImageStream(intrinsics)
-	val localizations = detectFiducials(intrinsics, frameBuffer, frames)
-	val annotations = annotateImages(intrinsics, localizations)
+	// frameGenerator -> { many annotatedImageStream generators } -> | broadcast to UDP and annotate in parallel |
+	// (frameGenerator -> fiducial annotation -> ring buffer) and in parallel (ring buffer -> broadcast -> render)
+	val webcamStream = Channel<BufferedImage>()
+	val frameBuffer = CircularReferenceBuffer<AnnotatedImage>(FIDUCIAL_BUFFER_SIZE) { AnnotatedImage.preallocate(BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB)) }
+	val annotatedImageStream = Channel<BufferedImage>()
+
+	launch {
+		generateImageStream(quit, intrinsics, webcamStream)
+	}
+	launch {
+		detectFiducials(quit, webcamStream, intrinsics, frameBuffer) // Pushes to the frame buffer
+	}
+	launch {
+		val poseData = broadcastFiducialPoses(quit, frameBuffer)
+		annotateImages(intrinsics, poseData, annotatedImageStream)
+	}
 
 	val gui = ImagePanel()
-	gui.preferredSize = java.awt.Dimension(1280, 720) //webcam.viewSize
+	gui.preferredSize = java.awt.Dimension(width, height) //webcam.viewSize
 	ShowImages.showWindow(gui, "TITLE!", true)
-
-	// Reminder: maximum UDP packet size: 16kb.
-
-	for(img in annotations) {
+	for(img in annotatedImageStream) {
 		//val annotatedImage: AnnotatedImage = localizations.receive()
 		gui.setImageRepaint(img)
 	}
@@ -102,29 +113,29 @@ fun withFrameIterator(width: Int, height: Int, f: (img: BufferedImage) -> Unit) 
 	}
 }
 
-@OptIn(ExperimentalCoroutinesApi::class)
-fun CoroutineScope.generateImageStream(intrinsics: CameraPinholeBrown): ReceiveChannel<BufferedImage> = produce<BufferedImage> {
+suspend fun generateImageStream(quit: AtomicBoolean, intrinsics: CameraPinholeBrown, channel: Channel<BufferedImage>) {
 	val webcam = UtilWebcamCapture.openDefault(intrinsics.width, intrinsics.height)
-	while(true) {
+	while(!quit.get() && !channel.isClosedForSend) {
 		val image = webcam.image ?: break
-		send(image)
+		channel.send(image)
 	}
 }
 
-@OptIn(ExperimentalCoroutinesApi::class)
-fun CoroutineScope.detectFiducials(intrinsics: CameraPinholeBrown, frameBuffer:CircularReferenceBuffer<AnnotatedImage>, imageStream: ReceiveChannel<BufferedImage>): ReceiveChannel<AnnotatedImage> = produce<AnnotatedImage> {
+suspend fun detectFiducials(quit: AtomicBoolean, imageStream: Channel<BufferedImage>, intrinsics: CameraPinholeBrown, frameBuffer:CircularReferenceBuffer<AnnotatedImage>) {
 	val detector = FactoryFiducial.squareHamming(ConfigHammingMarker.loadDictionary(HammingDictionary.APRILTAG_36h10), ConfigFiducialHammingDetector(), GrayU8::class.java)
 	detector.setLensDistortion(intrinsics.asNarrowDistortion(), intrinsics.width, intrinsics.height)
 	assert(detector.is3D)
 
 	var frameCount = 0
 
-	for(image in imageStream) {
-		val ref = frameBuffer.writeNext()
-		if(ref == null) {
-			Thread.sleep(100)
-			continue
+	while(!quit.get() && !imageStream.isClosedForReceive) {
+		var ref: AnnotatedImage? = null;
+		while(ref == null) {
+			delay(1)
+			ref = frameBuffer.writeNext()
 		}
+
+		val image = imageStream.receive()
 
 		frameCount++
 
@@ -140,20 +151,26 @@ fun CoroutineScope.detectFiducials(intrinsics: CameraPinholeBrown, frameBuffer:C
 			detector.getBounds(i, ref.bounds[i])
 			detector.getFiducialToCamera(i, ref.pose[i])
 		}
-
-		send(ref)
-		Thread.sleep(1)
 		//frameBuffer.readNext() // Mark as read?
 	}
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
-fun CoroutineScope.broadcastFiducialPoses(imageData: ReceiveChannel<AnnotatedImage>): ReceiveChannel<AnnotatedImage> = produce {
+fun CoroutineScope.broadcastFiducialPoses(quit: AtomicBoolean, buffer: CircularReferenceBuffer<AnnotatedImage>): ReceiveChannel<AnnotatedImage> = produce {
 	// TODO: Send out the image and then maybe push it onto the annotated image pile.
+	// Reminder: maximum UDP packet size: 16kb.
+	while(!quit.get()) {
+		val data = buffer.readNext()
+		if(data != null) {
+			// For now, just send.  This function is basically a NOOP that reads from the ring buffer and pushes back into a stream.
+			send(data)
+		} else {
+			delay(1)
+		}
+	}
 }
 
-@OptIn(ExperimentalCoroutinesApi::class)
-fun CoroutineScope.annotateImages(intrinsics: CameraPinholeBrown, annotatedImageStream: ReceiveChannel<AnnotatedImage>): ReceiveChannel<BufferedImage> = produce {
+suspend fun annotateImages(intrinsics: CameraPinholeBrown, annotatedImageStream: ReceiveChannel<AnnotatedImage>, outputStream: Channel<BufferedImage>) {
 	for(annotatedImage in annotatedImageStream) {
 		val image: BufferedImage = annotatedImage.img
 		val g2 = image.createGraphics()
@@ -166,7 +183,7 @@ fun CoroutineScope.annotateImages(intrinsics: CameraPinholeBrown, annotatedImage
 			VisualizeFiducial.drawCube(annotatedImage.pose[i], intrinsics, 1.0, 1, g2)
 			VisualizeFiducial.drawLabelCenter(annotatedImage.pose[i], intrinsics, ". ID:${ident}", g2)
 		}
-		send(image)
+		outputStream.send(image)
 	}
 
 }
