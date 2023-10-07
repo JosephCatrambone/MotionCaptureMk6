@@ -1,5 +1,6 @@
 plugins {
     kotlin("jvm") version "1.9.0"
+    kotlin("plugin.serialization") version "1.9.10"
     application
 }
 
@@ -15,6 +16,7 @@ dependencies {
     testImplementation(kotlin("test"))
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.5.1")
 
     arrayOf("core","swing","kotlin","WebcamCapture").forEach() {
         implementation("org.boofcv:boofcv-$it:$boofVersion")

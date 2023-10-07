@@ -14,6 +14,7 @@ import boofcv.io.webcamcapture.UtilWebcamCapture
 import boofcv.kotlin.asGrayF32
 import boofcv.kotlin.asGrayU8
 import boofcv.kotlin.asNarrowDistortion
+
 import boofcv.struct.calib.CameraPinholeBrown
 import boofcv.struct.image.GrayU8
 import georegression.struct.point.Point2D_F64
@@ -28,44 +29,20 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
 import java.util.concurrent.atomic.AtomicBoolean
 
+const val DEFAULT_BIND_PORT = 42069
 const val CALIBRATION_FILENAME = "intrinsics.yaml"
-const val RAW_CAMERA_BUFFER_SIZE = 120
 const val FIDUCIAL_BUFFER_SIZE = 120
-const val MAX_DETECTIONS = 512
+const val MAX_DETECTIONS = 254  // Capped because we need to fit all of it in a UDP packet.
 const val ANNOTATION_WORKERS = 1
+const val DISPLAY_BUFFER_SIZE = 30
 
-class AnnotatedImage(
-	var img: BufferedImage,
-	var detections: Int,
-	var frameNumber: Int,
-	var frameTime: Float,
-	val ids: MutableList<Long>,
-	val pose: List<Se3_F64>,
-	// These are both extra annotations
-	val bounds: List<Polygon2D_F64>,
-	val pixel: List<Point2D_F64>,
-) {
-	companion object {
-		fun preallocate(img: BufferedImage): AnnotatedImage {
-			return AnnotatedImage(
-				img = img,
-				detections = 0,
-				frameNumber = 0,
-				frameTime = 0.0F,
-				MutableList(MAX_DETECTIONS) { 0 },
-				MutableList(MAX_DETECTIONS) { Se3_F64() },
-				MutableList(MAX_DETECTIONS) { Polygon2D_F64() },
-				MutableList(MAX_DETECTIONS) { Point2D_F64() }
-			)
-		}
-	}
-}
+
 
 
 fun main(args: Array<String>) = runBlocking {
 	//val tagDirectory: String = UtilIO.pathExample("fiducial/square_hamming/aruco_25h7")
-	val width = 1280
-	val height = 720
+	val width = 640
+	val height = 360
 	val quit = AtomicBoolean(false)
 
 	// Try loading calibration OR calibrate
@@ -82,16 +59,18 @@ fun main(args: Array<String>) = runBlocking {
 	// (frameGenerator -> fiducial annotation -> ring buffer) and in parallel (ring buffer -> broadcast -> render)
 	val webcamStream = Channel<BufferedImage>()
 	val frameBuffer = CircularReferenceBuffer<AnnotatedImage>(FIDUCIAL_BUFFER_SIZE) { AnnotatedImage.preallocate(BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB)) }
-	val annotatedImageStream = Channel<BufferedImage>()
+	val annotatedImageStream = Channel<BufferedImage>(DISPLAY_BUFFER_SIZE, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
 	launch {
 		generateImageStream(quit, intrinsics, webcamStream)
 	}
-	launch {
-		detectFiducials(quit, webcamStream, intrinsics, frameBuffer) // Pushes to the frame buffer
+	repeat(ANNOTATION_WORKERS) {
+		launch {
+			detectFiducials(quit, webcamStream, intrinsics, frameBuffer) // Pushes to the frame buffer
+		}
 	}
 	launch {
-		val poseData = broadcastFiducialPoses(quit, frameBuffer)
+		val poseData = broadcastFiducialPoses(quit, DEFAULT_BIND_PORT, frameBuffer)
 		annotateImages(intrinsics, poseData, annotatedImageStream)
 	}
 
@@ -121,54 +100,8 @@ suspend fun generateImageStream(quit: AtomicBoolean, intrinsics: CameraPinholeBr
 	}
 }
 
-suspend fun detectFiducials(quit: AtomicBoolean, imageStream: Channel<BufferedImage>, intrinsics: CameraPinholeBrown, frameBuffer:CircularReferenceBuffer<AnnotatedImage>) {
-	val detector = FactoryFiducial.squareHamming(ConfigHammingMarker.loadDictionary(HammingDictionary.APRILTAG_36h10), ConfigFiducialHammingDetector(), GrayU8::class.java)
-	detector.setLensDistortion(intrinsics.asNarrowDistortion(), intrinsics.width, intrinsics.height)
-	assert(detector.is3D)
 
-	var frameCount = 0
 
-	while(!quit.get() && !imageStream.isClosedForReceive) {
-		var ref: AnnotatedImage? = null;
-		while(ref == null) {
-			delay(1)
-			ref = frameBuffer.writeNext()
-		}
-
-		val image = imageStream.receive()
-
-		frameCount++
-
-		// For QR
-		//detector.process(image.asGrayU8())
-		detector.detect(image.asGrayU8())
-		ref.frameNumber = frameCount
-		ref.detections = detector.totalFound()
-		ref.img = image
-		for(i in 0..< min(MAX_DETECTIONS, ref.detections)) {
-			ref.ids[i] = detector.getId(i)
-			detector.getCenter(i, ref.pixel[i])
-			detector.getBounds(i, ref.bounds[i])
-			detector.getFiducialToCamera(i, ref.pose[i])
-		}
-		//frameBuffer.readNext() // Mark as read?
-	}
-}
-
-@OptIn(ExperimentalCoroutinesApi::class)
-fun CoroutineScope.broadcastFiducialPoses(quit: AtomicBoolean, buffer: CircularReferenceBuffer<AnnotatedImage>): ReceiveChannel<AnnotatedImage> = produce {
-	// TODO: Send out the image and then maybe push it onto the annotated image pile.
-	// Reminder: maximum UDP packet size: 16kb.
-	while(!quit.get()) {
-		val data = buffer.readNext()
-		if(data != null) {
-			// For now, just send.  This function is basically a NOOP that reads from the ring buffer and pushes back into a stream.
-			send(data)
-		} else {
-			delay(1)
-		}
-	}
-}
 
 suspend fun annotateImages(intrinsics: CameraPinholeBrown, annotatedImageStream: ReceiveChannel<AnnotatedImage>, outputStream: Channel<BufferedImage>) {
 	for(annotatedImage in annotatedImageStream) {
@@ -188,79 +121,3 @@ suspend fun annotateImages(intrinsics: CameraPinholeBrown, annotatedImageStream:
 
 }
 
-fun runCalibration(width: Int, height: Int): CameraPinholeBrown {
-	val webcam = UtilWebcamCapture.openDefault(width, height)
-
-	val gui = ImagePanel()
-	gui.preferredSize = webcam.viewSize
-	ShowImages.showWindow(gui, "Calibration", true)
-
-	val spacing = 20.0
-	val yIntersections = 11 // One less than the number of 'columns'.
-	val xIntersections = 9
-	val worldPoints = mutableListOf<Point2D_F64>() // Boof assumes right-handed z-forward, which means +y is down, right?
-	for(y in 0..yIntersections+1) {
-		for(x in 0..xIntersections+1) {
-			worldPoints.add(Point2D_F64(x * spacing, y * spacing))
-		}
-	}
-	//val detector = MultiToSingleFiducialCalibration(FactoryFiducial.ecocheck(null, ConfigECoCheckMarkers.singleShape(9, 7, 1, 30)))
-	val detector = FactoryFiducialCalibration.chessboardX(null, ConfigGridDimen(yIntersections+1, xIntersections+1, spacing)) // 11,9 -> Finding 8x10 intersections
-	val calibrator = CalibrateMonoPlanar(worldPoints)
-	calibrator.configurePinhole(true, 2, false)
-	calibrator.reset()
-
-	val selectedImages = mutableListOf<BufferedImage>()
-	var frameSkips: Int = 0
-	while(true) {
-		val image = webcam.image ?: break;
-		val g2 = image.createGraphics()
-		g2.drawString("Camera Uncalibrated - Capturing ${xIntersections}x${yIntersections} chess board", 100, 100)
-		if(frameSkips == 0 && detector.process(image.asGrayF32())) {
-			if(selectedImages.isEmpty()) {
-				// TODO: Init calibrator?
-			}
-			val points = detector.detectedPoints.copy()
-			calibrator.addImage(points)
-			selectedImages.add(image)
-			points.points.forEach {
-				VisualizeFeatures.drawPoint(g2, it.p.x.toInt(), it.p.y.toInt(), 2, Color.RED)
-			}
-			frameSkips += 10 // Drop a few frames so we can reposition.
-		} else {
-			frameSkips = max(frameSkips-1, 0)
-		}
-		gui.setImageRepaint(image)
-		if(selectedImages.count() > 50) {
-			break;
-		}
-	}
-	val intrinsics = calibrator.process<CameraPinholeBrown>()
-	CalibrationIO.save(intrinsics, CALIBRATION_FILENAME)
-	intrinsics.print()
-	webcam.close()
-	return intrinsics
-}
-
-/*
-# Pinhole camera model with radial and tangential distortion
-# (fx,fy) = focal length, (cx,cy) = principle point, (width,height) = image shape
-# radial = radial distortion, (t1,t2) = tangential distortion
-
-pinhole:
-  fx: 632.6331008160633
-  fy: 629.4057227776121
-  cx: 401.16829030891256
-  cy: 229.2684635210703
-  width: 800
-  height: 450
-  skew: 0.0
-model: pinhole_radial_tangential
-radial_tangential:
-  radial:
-  - 0.07946796807805329
-  - -0.1703344505939042
-  t1: 0.0
-  t2: 0.0
-version: 0
- */
